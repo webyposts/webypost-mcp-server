@@ -59,6 +59,7 @@ app.get("/health", (_req: Request, res: Response) => {
       "list_webypost_accounts",
       "check_webypost_status",
       "publish_webypost_post",
+      "publish_webypost_article",
     ],
     transports: {
       streamableHttp: "/mcp",
@@ -91,7 +92,7 @@ https://YOUR-SUBDOMAIN.ngrok-free.app/mcp</pre>
     <li><a href="/health"><code>/health</code></a></li>
     <li>Target site: <code>${config.webypostBaseUrl}</code></li>
     <li>Accounts: <code>${config.accounts.map((a) => a.id).join(", ") || "(none)"}</code> (default: <code>${config.defaultAccountId}</code>)</li>
-    <li>Tools: <code>list_webypost_accounts</code>, <code>check_webypost_status</code>, <code>publish_webypost_post</code></li>
+    <li>Tools: <code>list_webypost_accounts</code>, <code>check_webypost_status</code>, <code>publish_webypost_post</code>, <code>publish_webypost_article</code></li>
   </ul>
   <h2>Local only (not reachable by Grok)</h2>
   <pre>http://127.0.0.1:${config.port}/mcp

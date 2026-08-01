@@ -38,6 +38,27 @@ export type PublishResult = {
   details?: Record<string, unknown>;
 };
 
+export type PublishArticleInput = {
+  title: string;
+  content: string;
+  privacy?: "Public" | "Private" | "Friends";
+  /** Main category (maps to department). e.g. "Tech Reviews & Gadgets" */
+  category?: string;
+  /** Sub-category (maps to subc) */
+  subcategory?: string;
+  /** Meta description for SEO */
+  metadesc?: string;
+  /** Comma-separated SEO keywords */
+  keywords?: string;
+  /** Comma-separated tags */
+  tags?: string;
+  /**
+   * Optional cover image URL (https). Downloaded and uploaded as fileToUpload1.
+   * Skip if unavailable — articles can publish without a cover.
+   */
+  coverImageUrl?: string;
+};
+
 function isJsonContentType(ct: string | undefined): boolean {
   return !!ct && ct.toLowerCase().includes("application/json");
 }
@@ -257,6 +278,222 @@ export class WebypostClient {
     };
   }
 
+  /** Ensure session is authenticated for this account. */
+  private async ensureAuth(): Promise<StatusResult | null> {
+    if (!this.loggedIn && !this.account.sessionCookie) {
+      const auth = await this.login();
+      if (!auth.ok || !auth.authenticated) {
+        return auth;
+      }
+    } else if (!this.loggedIn && this.account.sessionCookie) {
+      this.loggedIn = true;
+    }
+    return null;
+  }
+
+  /**
+   * Publish a long-form article via editor.php (AJAX JSON, same as web editor).
+   * Maps: title→title, content→teaser, category→department, subcategory→subc.
+   */
+  async publishArticle(input: PublishArticleInput): Promise<PublishResult> {
+    const title = (input.title || "").trim();
+    let body = (input.content || "").trim();
+    const privacy = input.privacy ?? config.defaultPrivacy;
+
+    if (!title) {
+      return {
+        ok: false,
+        message: "title is required for articles.",
+        account: this.account.id,
+      };
+    }
+    if (!body) {
+      return {
+        ok: false,
+        message: "content is required (article body HTML or plain text).",
+        account: this.account.id,
+      };
+    }
+
+    // Editor stores HTML; wrap plain text paragraphs lightly
+    if (!/<[a-z][\s\S]*>/i.test(body)) {
+      body = body
+        .split(/\n{2,}/)
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
+        .join("\n");
+    }
+
+    const authFail = await this.ensureAuth();
+    if (authFail) {
+      return {
+        ok: false,
+        message: `Login required before publishing article: ${authFail.message}`,
+        account: this.account.id,
+        details: authFail.details,
+      };
+    }
+
+    const category =
+      (input.category || "").trim() || "Tech Reviews & Gadgets";
+    const subcategory =
+      (input.subcategory || "").trim() || "Upcoming Tech Launches";
+    const keywords =
+      (input.keywords || "").trim() ||
+      title
+        .split(/\s+/)
+        .filter((w) => w.length > 2)
+        .slice(0, 6)
+        .join(", ");
+    const tags = (input.tags || keywords).trim();
+    const metadesc =
+      (input.metadesc || "").trim() ||
+      stripHtml(body).slice(0, 155).trim();
+
+    const form = new FormData();
+    form.set("submit", "1");
+    form.set("title", title);
+    form.set("teaser", body);
+    form.set("metadesc", metadesc);
+    form.set("keyword", keywords);
+    form.set("input", tags);
+    form.set("privacy", privacy);
+    form.set("department", category);
+    form.set("subc", subcategory);
+    form.set("cropdata", "");
+
+    // Optional cover from public URL
+    const coverUrl = (input.coverImageUrl || "").trim();
+    if (coverUrl && /^https?:\/\//i.test(coverUrl)) {
+      try {
+        const imgRes = await this.http.get(coverUrl, {
+          responseType: "arraybuffer",
+          timeout: Math.max(config.requestTimeoutMs, 45000),
+          headers: { Accept: "image/*,*/*" },
+          maxRedirects: 5,
+        });
+        if (imgRes.status >= 200 && imgRes.status < 300 && imgRes.data) {
+          const buf = Buffer.from(imgRes.data);
+          const ct = String(imgRes.headers["content-type"] || "image/jpeg");
+          const ext = ct.includes("png")
+            ? "png"
+            : ct.includes("webp")
+              ? "webp"
+              : ct.includes("gif")
+                ? "gif"
+                : "jpg";
+          const blob = new Blob([buf], { type: ct.split(";")[0].trim() });
+          form.set("fileToUpload1", blob, `cover.${ext}`);
+        }
+      } catch {
+        // Cover is optional — continue without it
+      }
+    }
+
+    const postUrl = absUrl("/editor.php");
+    const res = await this.http.post(postUrl, form, {
+      headers: {
+        Accept: "application/json",
+        "X-WP-Editor-Ajax": "1",
+        "X-Requested-With": "XMLHttpRequest",
+        Origin: config.webypostBaseUrl,
+        Referer: absUrl("/editor.php"),
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      // Let axios set multipart boundary for FormData
+      transformRequest: [
+        (data, headers) => {
+          // axios + FormData: remove forced json content-type if any
+          if (data instanceof FormData && headers) {
+            delete (headers as Record<string, unknown>)["Content-Type"];
+            delete (headers as Record<string, unknown>)["content-type"];
+          }
+          return data;
+        },
+      ],
+    });
+
+    const ct = String(res.headers["content-type"] || "");
+    let data: Record<string, unknown> = {};
+    if (isJsonContentType(ct) && res.data && typeof res.data === "object") {
+      data = res.data as Record<string, unknown>;
+    } else if (typeof res.data === "string") {
+      const text = res.data.trim();
+      if (text.startsWith("{")) {
+        try {
+          data = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          data = { raw: text.slice(0, 400) };
+        }
+      } else {
+        data = { raw: text.slice(0, 400) };
+      }
+    }
+
+    if (res.status === 401 || data.error === "Not logged in") {
+      this.loggedIn = false;
+      const retryLogin = await this.login();
+      if (!retryLogin.ok) {
+        return {
+          ok: false,
+          message: `Session expired and re-login failed: ${retryLogin.message}`,
+          account: this.account.id,
+          details: { httpStatus: res.status, data },
+        };
+      }
+      return this.publishArticle(input);
+    }
+
+    if (res.status >= 200 && res.status < 300 && data.ok === true) {
+      const id = Number(data.id) || undefined;
+      const slug = typeof data.slug === "string" ? data.slug : "";
+      let url =
+        typeof data.url === "string" && data.url
+          ? data.url
+          : undefined;
+      if (!url && id && slug) {
+        url = absUrl(`${slug}/article/${id}`);
+      } else if (url && !/^https?:\/\//i.test(url)) {
+        url = absUrl(url.replace(/^\//, ""));
+      }
+
+      return {
+        ok: true,
+        message: "Article published",
+        url,
+        pid: id,
+        slug: slug || undefined,
+        privacy,
+        account: this.account.id,
+        details: {
+          type: "article",
+          category,
+          subcategory,
+          httpStatus: res.status,
+          email: this.lastUserHint || this.account.email || null,
+        },
+      };
+    }
+
+    const failMsg =
+      (typeof data.error === "string" && data.error) ||
+      (typeof data.message === "string" && data.message) ||
+      `Article publish failed (HTTP ${res.status})`;
+
+    return {
+      ok: false,
+      message: failMsg,
+      account: this.account.id,
+      details: {
+        type: "article",
+        httpStatus: res.status,
+        response: data,
+      },
+    };
+  }
+
   /**
    * Publish a text status/post via poscode.php (AJAX JSON).
    * Maps MCP `title` → titles, `content` → name (body field used by Webypost compose).
@@ -277,18 +514,14 @@ export class WebypostClient {
       };
     }
 
-    if (!this.loggedIn && !this.account.sessionCookie) {
-      const auth = await this.login();
-      if (!auth.ok || !auth.authenticated) {
-        return {
-          ok: false,
-          message: `Login required before publishing: ${auth.message}`,
-          account: this.account.id,
-          details: auth.details,
-        };
-      }
-    } else if (!this.loggedIn && this.account.sessionCookie) {
-      this.loggedIn = true;
+    const authFail = await this.ensureAuth();
+    if (authFail) {
+      return {
+        ok: false,
+        message: `Login required before publishing: ${authFail.message}`,
+        account: this.account.id,
+        details: authFail.details,
+      };
     }
 
     const form = new URLSearchParams();
@@ -478,6 +711,23 @@ export function safePublishError(err: unknown): PublishResult {
     ok: false,
     message: errorMessage(err),
   };
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function stripHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 // silence unused in some builds

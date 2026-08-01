@@ -52,17 +52,24 @@ app.get("/health", (_req: Request, res: Response) => {
     service: "webypost-mcp-server",
     baseUrl: config.webypostBaseUrl,
     port: config.port,
-    credentialsConfigured: Boolean(config.email && config.password),
-    tools: ["check_webypost_status", "publish_webypost_post"],
+    credentialsConfigured: config.accounts.length > 0,
+    accounts: config.accounts.map((a) => a.id),
+    defaultAccount: config.defaultAccountId,
+    tools: [
+      "list_webypost_accounts",
+      "check_webypost_status",
+      "publish_webypost_post",
+    ],
     transports: {
       streamableHttp: "/mcp",
       legacySse: "/sse",
       legacyMessages: "/messages?sessionId=…",
     },
     grokHint:
-      "Prefer public HTTPS URL ending with /mcp (Streamable HTTP). Legacy clients may use /sse.",
+      "Prefer public HTTPS URL ending with /mcp (Streamable HTTP). Legacy clients may use /sse. Pass account=<id> to choose which Webypost login to use.",
   });
 });
+
 
 app.get("/", (_req: Request, res: Response) => {
   res.type("html").send(`<!doctype html>
@@ -83,7 +90,8 @@ https://YOUR-SUBDOMAIN.ngrok-free.app/mcp</pre>
   <ul>
     <li><a href="/health"><code>/health</code></a></li>
     <li>Target site: <code>${config.webypostBaseUrl}</code></li>
-    <li>Tools: <code>check_webypost_status</code>, <code>publish_webypost_post</code></li>
+    <li>Accounts: <code>${config.accounts.map((a) => a.id).join(", ") || "(none)"}</code> (default: <code>${config.defaultAccountId}</code>)</li>
+    <li>Tools: <code>list_webypost_accounts</code>, <code>check_webypost_status</code>, <code>publish_webypost_post</code></li>
   </ul>
   <h2>Local only (not reachable by Grok)</h2>
   <pre>http://127.0.0.1:${config.port}/mcp
@@ -266,7 +274,7 @@ const httpServer = app.listen(config.port, config.host, () => {
   console.log(`[webypost-mcp] Legacy SSE      → http://127.0.0.1:${config.port}/sse`);
   console.log(`[webypost-mcp] target site     → ${config.webypostBaseUrl}`);
   console.log(
-    `[webypost-mcp] credentials      → ${Boolean(config.email && config.password)}`
+    `[webypost-mcp] accounts         → ${config.accounts.map((a) => a.id).join(", ") || "(none)"} (default: ${config.defaultAccountId})`
   );
   console.log("");
   console.log("Public (Grok) via ngrok:");

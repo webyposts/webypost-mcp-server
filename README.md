@@ -182,13 +182,21 @@ This is the recommended production setup. Free Render URLs stay the same after r
    - **Build command:** `npm install && npm run build`
    - **Start command:** `npm start`
    - **Health check path:** `/health`
-3. Set environment variables:
-   - `WEBYPOST_BASE_URL=https://webypost.com`
-   - `WEBYPOST_EMAIL=…`
-   - `WEBYPOST_PASSWORD=…`
-   - `NODE_ENV=production`
-   - `HOST=0.0.0.0`
-   - `PORT` is injected by Render automatically
+3. Set environment variables (multi-account recommended):
+
+   | Key | Example |
+   |-----|---------|
+   | `WEBYPOST_BASE_URL` | `https://webypost.com` |
+   | `WEBYPOST_ACCOUNTS` | `{"main":{"email":"a@x.com","password":"…"},"brand":{"email":"b@x.com","password":"…"}}` |
+   | `WEBYPOST_DEFAULT_ACCOUNT` | `main` |
+   | `WEBYPOST_DEFAULT_PRIVACY` | `Public` |
+   | `NODE_ENV` | `production` |
+   | `HOST` | `0.0.0.0` |
+   | `PORT` | set by Render automatically |
+
+   Legacy single-account (only if you skip `WEBYPOST_ACCOUNTS`):
+   - `WEBYPOST_EMAIL` + `WEBYPOST_PASSWORD`
+
 
 ### Grok URL (after deploy)
 
@@ -214,9 +222,17 @@ Legacy clients can use `/sse` instead of `/mcp`.
 
 ## Tools (for Grok)
 
+### `list_webypost_accounts`
+
+No arguments. Lists configured account ids (emails masked) and the default.
+
 ### `check_webypost_status`
 
-No arguments. Returns:
+| Arg | Type | Required | Description |
+|-----|------|----------|-------------|
+| `account` | string | no | Account id from `WEBYPOST_ACCOUNTS` (default: `WEBYPOST_DEFAULT_ACCOUNT`) |
+
+Returns:
 
 ```json
 {
@@ -235,6 +251,7 @@ No arguments. Returns:
 | `title` | string | yes (may be `""`) | Post title |
 | `content` | string | yes | Post body |
 | `privacy` | enum | no | `Public` / `Private` / `Friends` |
+| `account` | string | no | Which Webypost login to use (`main`, `brand`, …) |
 
 Success example:
 

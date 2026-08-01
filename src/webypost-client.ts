@@ -1,11 +1,20 @@
 /**
  * HTTP automation layer for webypost.com (session + form posts).
  * Uses Axios + tough-cookie jar to mirror browser login/post flow.
+ *
+ * One WebypostClient instance = one account (own cookie jar).
+ * Use getClientForAccount() for multi-account MCP tools.
  */
 import axios, { type AxiosInstance, type AxiosError } from "axios";
 import { wrapper } from "axios-cookiejar-support";
 import { CookieJar } from "tough-cookie";
-import { config, absUrl, hasCredentials } from "./config.js";
+import {
+  config,
+  absUrl,
+  hasCredentials,
+  resolveAccount,
+  type AccountConfig,
+} from "./config.js";
 
 export type StatusResult = {
   ok: boolean;
@@ -13,6 +22,8 @@ export type StatusResult = {
   authenticated: boolean;
   baseUrl: string;
   message: string;
+  account?: string | null;
+  email?: string | null;
   details?: Record<string, unknown>;
 };
 
@@ -23,6 +34,7 @@ export type PublishResult = {
   pid?: number;
   slug?: string;
   privacy?: string;
+  account?: string | null;
   details?: Record<string, unknown>;
 };
 
@@ -71,15 +83,25 @@ export class WebypostClient {
   private http: AxiosInstance;
   private loggedIn = false;
   private lastUserHint = "";
+  private account: AccountConfig;
 
-  constructor() {
+  constructor(account?: AccountConfig) {
+    this.account =
+      account ??
+      resolveAccount(config.defaultAccountId) ?? {
+        id: "default",
+        email: config.email,
+        password: config.password,
+        sessionCookie: config.sessionCookie || undefined,
+      };
+
     this.jar = new CookieJar();
     this.http = wrapper(
       axios.create({
         jar: this.jar,
         timeout: config.requestTimeoutMs,
         maxRedirects: 5,
-        validateStatus: () => true, // handle status ourselves
+        validateStatus: () => true,
         headers: {
           "User-Agent":
             "WebypostMcpServer/1.0 (+https://webypost.com; MCP automation)",
@@ -88,10 +110,10 @@ export class WebypostClient {
       })
     );
 
-    if (config.sessionCookie) {
-      // Seed jar with optional pre-set cookies for the site origin
+    const seed = this.account.sessionCookie || "";
+    if (seed) {
       const origin = config.webypostBaseUrl;
-      for (const part of config.sessionCookie.split(";")) {
+      for (const part of seed.split(";")) {
         const c = part.trim();
         if (c) {
           try {
@@ -102,6 +124,14 @@ export class WebypostClient {
         }
       }
     }
+  }
+
+  get accountId(): string {
+    return this.account.id;
+  }
+
+  get accountEmail(): string {
+    return this.account.email;
   }
 
   /** GET site root — establishes PHPSESSID when cookies are enabled. */
@@ -128,8 +158,8 @@ export class WebypostClient {
    * Email/password login via logcode.php (JSON body, same as the web login SPA).
    */
   async login(email?: string, password?: string): Promise<StatusResult> {
-    const useEmail = (email ?? config.email).trim();
-    const usePass = password ?? config.password;
+    const useEmail = (email ?? this.account.email).trim();
+    const usePass = password ?? this.account.password;
 
     if (!useEmail || !usePass) {
       return {
@@ -137,12 +167,13 @@ export class WebypostClient {
         reachable: true,
         authenticated: false,
         baseUrl: config.webypostBaseUrl,
+        account: this.account.id,
+        email: useEmail || null,
         message:
-          "Missing WEBYPOST_EMAIL / WEBYPOST_PASSWORD. Set them in .env to authenticate.",
+          "Missing credentials for this account. Set WEBYPOST_ACCOUNTS (or WEBYPOST_EMAIL / WEBYPOST_PASSWORD).",
       };
     }
 
-    // Warm session cookie
     const ping = await this.ping();
     if (!ping.ok) {
       return {
@@ -150,6 +181,8 @@ export class WebypostClient {
         reachable: false,
         authenticated: false,
         baseUrl: config.webypostBaseUrl,
+        account: this.account.id,
+        email: useEmail,
         message: ping.message,
       };
     }
@@ -193,7 +226,9 @@ export class WebypostClient {
         reachable: true,
         authenticated: true,
         baseUrl: config.webypostBaseUrl,
-        message: `Authenticated as ${useEmail}`,
+        account: this.account.id,
+        email: useEmail,
+        message: `Authenticated as ${useEmail} (account: ${this.account.id})`,
         details: {
           redirect: data.redirect ?? null,
           httpStatus: res.status,
@@ -212,6 +247,8 @@ export class WebypostClient {
       reachable: true,
       authenticated: false,
       baseUrl: config.webypostBaseUrl,
+      account: this.account.id,
+      email: useEmail,
       message: errMsg,
       details: {
         httpStatus: res.status,
@@ -236,30 +273,31 @@ export class WebypostClient {
       return {
         ok: false,
         message: "content is required (this is the post body text).",
+        account: this.account.id,
       };
     }
 
-    if (!this.loggedIn && !config.sessionCookie) {
+    if (!this.loggedIn && !this.account.sessionCookie) {
       const auth = await this.login();
       if (!auth.ok || !auth.authenticated) {
         return {
           ok: false,
           message: `Login required before publishing: ${auth.message}`,
+          account: this.account.id,
           details: auth.details,
         };
       }
-    } else if (!this.loggedIn && config.sessionCookie) {
-      // Cookie-only mode: try a lightweight authenticated probe
+    } else if (!this.loggedIn && this.account.sessionCookie) {
       this.loggedIn = true;
     }
 
     const form = new URLSearchParams();
     form.set("submit", "1");
     form.set("wp_ajax", "1");
-    form.set("name", body); // post body (required by poscode.php)
-    form.set("titles", postTitle); // optional title
+    form.set("name", body);
+    form.set("titles", postTitle);
     form.set("privacy", privacy);
-    form.set("input", ""); // tags
+    form.set("input", "");
 
     const postUrl = absUrl("/poscode.php");
     const res = await this.http.post(postUrl, form.toString(), {
@@ -285,21 +323,20 @@ export class WebypostClient {
           data = { raw: text.slice(0, 400) };
         }
       } else if (/window\.location\.assign/i.test(text)) {
-        // Legacy HTML redirect success
         const m = text.match(/assign\(\s*["']([^"']+)["']/i);
         const path = m?.[1] || "";
         return {
           ok: true,
           message: "Post published (legacy redirect response).",
           url: path ? absUrl(path.replace(/^\//, "")) : undefined,
-          details: { httpStatus: res.status },
+          account: this.account.id,
+          details: { httpStatus: res.status, email: this.lastUserHint },
         };
       } else {
         data = { raw: text.slice(0, 400) };
       }
     }
 
-    // Session expired mid-flight
     if (res.status === 401 || data.error === "Not logged in") {
       this.loggedIn = false;
       const retryLogin = await this.login();
@@ -307,10 +344,10 @@ export class WebypostClient {
         return {
           ok: false,
           message: `Session expired and re-login failed: ${retryLogin.message}`,
+          account: this.account.id,
           details: { httpStatus: res.status, data },
         };
       }
-      // one retry
       return this.publishPost(title, content, privacy);
     }
 
@@ -332,10 +369,11 @@ export class WebypostClient {
         pid,
         slug: slug || undefined,
         privacy: typeof data.privacy === "string" ? data.privacy : privacy,
+        account: this.account.id,
         details: {
           photo_count: data.photo_count ?? 0,
           httpStatus: res.status,
-          account: this.lastUserHint || config.email || null,
+          email: this.lastUserHint || this.account.email || null,
         },
       };
     }
@@ -348,6 +386,7 @@ export class WebypostClient {
     return {
       ok: false,
       message: failMsg,
+      account: this.account.id,
       details: {
         httpStatus: res.status,
         response: data,
@@ -365,29 +404,32 @@ export class WebypostClient {
           reachable: false,
           authenticated: false,
           baseUrl: config.webypostBaseUrl,
+          account: this.account.id,
+          email: this.account.email || null,
           message: ping.message,
           details: { httpStatus: ping.status },
         };
       }
 
-      if (!hasCredentials() && !config.sessionCookie) {
+      if (!this.account.email && !this.account.password && !this.account.sessionCookie) {
         return {
           ok: true,
           reachable: true,
           authenticated: false,
           baseUrl: config.webypostBaseUrl,
-          message: `Site is reachable at ${config.webypostBaseUrl}, but no credentials are configured (set WEBYPOST_EMAIL + WEBYPOST_PASSWORD).`,
+          account: this.account.id,
+          message: `Site is reachable, but account "${this.account.id}" has no credentials.`,
         };
       }
 
-      if (config.sessionCookie && !hasCredentials()) {
+      if (this.account.sessionCookie && !this.account.password) {
         return {
           ok: true,
           reachable: true,
           authenticated: true,
           baseUrl: config.webypostBaseUrl,
-          message:
-            "Site reachable. Using WEBYPOST_SESSION_COOKIE (password login skipped).",
+          account: this.account.id,
+          message: `Site reachable. Account "${this.account.id}" using session cookie (password login skipped).`,
         };
       }
 
@@ -399,10 +441,36 @@ export class WebypostClient {
         reachable: false,
         authenticated: false,
         baseUrl: config.webypostBaseUrl,
+        account: this.account.id,
         message: errorMessage(err),
       };
     }
   }
+}
+
+/** One cookie-jar client per account id for the process lifetime */
+const clientPool = new Map<string, WebypostClient>();
+
+/**
+ * Resolve account by id (or default) and return a dedicated client.
+ * Throws a friendly Error if the account id is unknown.
+ */
+export function getClientForAccount(accountId?: string | null): WebypostClient {
+  const resolved = resolveAccount(accountId);
+  if (!resolved) {
+    const known = config.accounts.map((a) => a.id).join(", ") || "(none)";
+    throw new Error(
+      accountId
+        ? `Unknown account "${accountId}". Configured accounts: ${known}`
+        : `No Webypost accounts configured. Set WEBYPOST_ACCOUNTS (or WEBYPOST_EMAIL + WEBYPOST_PASSWORD). Known: ${known}`
+    );
+  }
+  let client = clientPool.get(resolved.id);
+  if (!client) {
+    client = new WebypostClient(resolved);
+    clientPool.set(resolved.id, client);
+  }
+  return client;
 }
 
 export function safePublishError(err: unknown): PublishResult {
@@ -411,3 +479,6 @@ export function safePublishError(err: unknown): PublishResult {
     message: errorMessage(err),
   };
 }
+
+// silence unused in some builds
+void hasCredentials;

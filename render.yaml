@@ -17,9 +17,10 @@ services:
       # PORT is set automatically by Render
       - key: WEBYPOST_BASE_URL
         value: https://webypost.com
-      - key: WEBYPOST_EMAIL
+      # Multi-account JSON — set real emails/passwords in the dashboard (secret)
+      - key: WEBYPOST_ACCOUNTS
         sync: false
-      - key: WEBYPOST_PASSWORD
+      - key: WEBYPOST_DEFAULT_ACCOUNT
         sync: false
       - key: WEBYPOST_DEFAULT_PRIVACY
         value: Public

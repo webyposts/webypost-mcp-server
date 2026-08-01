@@ -270,28 +270,30 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "publish_webypost_post",
-    "Publish a Webypost STATUS post. OPTIONAL image: set imageUrl to a public https image URL (from Grok Imagine) or data:image URL. For required photo posts use publish_webypost_with_image instead. NOT text-only — imageUrl is supported.",
+    "Publish a Webypost status/feed post. SUPPORTS IMAGES even if only text fields are visible: put [[IMAGE:https://public-url.jpg]] on its own line inside content (or IMAGE_URL=https://...). Also accepts imageUrl param when the client exposes it. Server downloads the image and attaches it as a post photo.",
     {
       content: z
         .string()
         .min(1)
-        .describe("Required post body text."),
+        .describe(
+          "Required post body. To attach a photo, include a line: [[IMAGE:https://YOUR_PUBLIC_IMAGE_URL]] or [[IMAGE:data:image/png;base64,XXXX]]. Markers are removed from the visible post text. Use a public https image URL (CDN, Imgur, your site, etc.)."
+        ),
       title: z
         .string()
         .optional()
-        .describe("Optional short title. Can be empty."),
+        .describe("Optional short title. Can also contain [[IMAGE:url]] markers."),
       privacy: privacyArg,
       imageUrl: z
         .string()
         .optional()
         .describe(
-          "OPTIONAL image URL to attach as post photo. Use public https://… link from Imagine, or data:image/png;base64,…. Server downloads and uploads to Webypost."
+          "Optional public https image URL or data:image/…;base64,… (if your client exposes this field)."
         ),
       imageUrls: z
         .string()
         .optional()
         .describe(
-          "OPTIONAL extra image URLs as one string (comma or newline separated). Max 8 total with imageUrl."
+          "Optional extra image URLs as one string (comma or newline separated)."
         ),
       account: accountArg,
     },

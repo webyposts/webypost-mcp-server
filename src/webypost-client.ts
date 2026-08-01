@@ -45,10 +45,48 @@ export type PublishPostInput = {
   /**
    * Optional image URLs (https or data:image/…;base64,…).
    * Downloaded/decoded and uploaded as fileToUpload1[] (max 8, same as Webypost UI).
-   * Use after Grok Imagine: generate image → pass public/shareable URL(s) here.
    */
   imageUrls?: string[];
 };
+
+/**
+ * Extract image markers embedded in post body/title so clients that only
+ * expose text fields (e.g. Grok frozen tool schemas) can still attach photos.
+ *
+ * Supported markers (one per line or inline):
+ *   [[IMAGE:https://example.com/photo.jpg]]
+ *   [[image:data:image/png;base64,...]]
+ *   IMAGE_URL=https://...
+ *   IMAGE_URL: https://...
+ */
+export function extractEmbeddedImages(text: string): {
+  cleanText: string;
+  imageUrls: string[];
+} {
+  const urls: string[] = [];
+  let clean = text || "";
+
+  // [[IMAGE:url]] or [[image:url]] — non-greedy for https; special case data URLs
+  const bracketRe =
+    /\[\[\s*image\s*:\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+|https?:\/\/[^\]\s]+)\s*\]\]/gi;
+  clean = clean.replace(bracketRe, (_m, url: string) => {
+    const u = String(url || "").replace(/\s+/g, "").trim();
+    if (u) urls.push(u.startsWith("data:") ? u : u);
+    return "";
+  });
+
+  // IMAGE_URL=... or IMAGE_URL: ...
+  const lineRe =
+    /^\s*IMAGE_URL\s*[=:]\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+|https?:\/\/\S+)\s*$/gim;
+  clean = clean.replace(lineRe, (_m, url: string) => {
+    const u = String(url || "").replace(/\s+/g, "").trim();
+    if (u) urls.push(u);
+    return "";
+  });
+
+  clean = clean.replace(/\n{3,}/g, "\n\n").trim();
+  return { cleanText: clean, imageUrls: [...new Set(urls)].slice(0, 8) };
+}
 
 export type PublishArticleInput = {
   title: string;
@@ -505,10 +543,16 @@ export class WebypostClient {
           }
         : titleOrInput;
 
-    const body = (input.content || "").trim();
-    const postTitle = (input.title || "").trim();
+    const embedded = extractEmbeddedImages(input.content || "");
+    const embeddedTitle = extractEmbeddedImages(input.title || "");
+    const body = embedded.cleanText.trim();
+    const postTitle = embeddedTitle.cleanText.trim();
     const usePrivacy = input.privacy ?? config.defaultPrivacy;
-    const imageUrls = (input.imageUrls || [])
+    const imageUrls = [
+      ...(input.imageUrls || []),
+      ...embedded.imageUrls,
+      ...embeddedTitle.imageUrls,
+    ]
       .map((u) => String(u || "").trim())
       .filter(Boolean)
       .slice(0, 8);
@@ -516,7 +560,8 @@ export class WebypostClient {
     if (!body) {
       return {
         ok: false,
-        message: "content is required (this is the post body text).",
+        message:
+          "content is required (post body text). To attach an image when your client has no imageUrl field, put this on its own line in content: [[IMAGE:https://your-public-image-url.jpg]]",
         account: this.account.id,
       };
     }

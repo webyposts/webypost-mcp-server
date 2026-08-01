@@ -16,18 +16,18 @@
   "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.15.30",
     "axios": "^1.19.0",
     "axios-cookiejar-support": "^7.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "tough-cookie": "^6.0.2",
+    "typescript": "^5.8.3",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/express": "^5.0.6",
-    "@types/node": "^26.1.2",
     "@types/tough-cookie": "^4.0.5",
-    "tsx": "^4.23.1",
-    "typescript": "^7.0.2"
+    "tsx": "^4.23.1"
   }
 }

@@ -6,7 +6,8 @@ services:
     runtime: node
     plan: free
     region: oregon
-    buildCommand: npm install && npm run build
+    # NODE_ENV=production skips devDependencies; install types + tsc explicitly
+    buildCommand: npm install --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /health
     envVars:

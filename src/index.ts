@@ -61,13 +61,28 @@ app.get("/health", (_req: Request, res: Response) => {
       "publish_webypost_post",
       "publish_webypost_article",
     ],
+    toolCapabilities: {
+      publish_webypost_post: {
+        text: true,
+        images: true,
+        imageParams: ["imageUrl", "imageUrls"],
+        maxImages: 8,
+        note: "Status/feed post. Pass public https image URLs or data:image/…;base64 after Grok Imagine.",
+      },
+      publish_webypost_article: {
+        text: true,
+        coverImage: true,
+        coverParam: "coverImageUrl",
+        note: "Long-form article (/article/…). Optional coverImageUrl.",
+      },
+    },
     transports: {
       streamableHttp: "/mcp",
       legacySse: "/sse",
       legacyMessages: "/messages?sessionId=…",
     },
     grokHint:
-      "Prefer public HTTPS URL ending with /mcp (Streamable HTTP). Legacy clients may use /sse. Pass account=<id> to choose which Webypost login to use.",
+      "Prefer public HTTPS URL ending with /mcp. Tools: publish_webypost_post (text+images via imageUrl/imageUrls), publish_webypost_article (long-form + coverImageUrl). Reconnect MCP after each Render deploy so Grok refreshes tool schemas.",
   });
 });
 

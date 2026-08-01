@@ -36,7 +36,8 @@ const accountArg = z
 export function createMcpServer(): McpServer {
   const server = new McpServer({
     name: "webypost-mcp-server",
-    version: "1.0.0",
+    // Bump when tools/params change so clients (Grok) treat this as a new schema
+    version: "1.2.0",
   });
 
   server.tool(
@@ -126,6 +127,8 @@ export function createMcpServer(): McpServer {
     {
       title: z
         .string()
+        .optional()
+        .default("")
         .describe(
           "Optional short title for the post (maps to Webypost titles field). Can be empty string."
         ),

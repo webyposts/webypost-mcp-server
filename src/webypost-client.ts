@@ -38,6 +38,18 @@ export type PublishResult = {
   details?: Record<string, unknown>;
 };
 
+export type PublishPostInput = {
+  title: string;
+  content: string;
+  privacy?: "Public" | "Private" | "Friends";
+  /**
+   * Optional image URLs (https or data:image/…;base64,…).
+   * Downloaded/decoded and uploaded as fileToUpload1[] (max 8, same as Webypost UI).
+   * Use after Grok Imagine: generate image → pass public/shareable URL(s) here.
+   */
+  imageUrls?: string[];
+};
+
 export type PublishArticleInput = {
   title: string;
   content: string;
@@ -53,8 +65,8 @@ export type PublishArticleInput = {
   /** Comma-separated tags */
   tags?: string;
   /**
-   * Optional cover image URL (https). Downloaded and uploaded as fileToUpload1.
-   * Skip if unavailable — articles can publish without a cover.
+   * Optional cover image URL (https or data:image/…;base64,…).
+   * Downloaded and uploaded as fileToUpload1.
    */
   coverImageUrl?: string;
 };
@@ -363,31 +375,12 @@ export class WebypostClient {
     form.set("subc", subcategory);
     form.set("cropdata", "");
 
-    // Optional cover from public URL
+    // Optional cover image
     const coverUrl = (input.coverImageUrl || "").trim();
-    if (coverUrl && /^https?:\/\//i.test(coverUrl)) {
-      try {
-        const imgRes = await this.http.get(coverUrl, {
-          responseType: "arraybuffer",
-          timeout: Math.max(config.requestTimeoutMs, 45000),
-          headers: { Accept: "image/*,*/*" },
-          maxRedirects: 5,
-        });
-        if (imgRes.status >= 200 && imgRes.status < 300 && imgRes.data) {
-          const buf = Buffer.from(imgRes.data);
-          const ct = String(imgRes.headers["content-type"] || "image/jpeg");
-          const ext = ct.includes("png")
-            ? "png"
-            : ct.includes("webp")
-              ? "webp"
-              : ct.includes("gif")
-                ? "gif"
-                : "jpg";
-          const blob = new Blob([buf], { type: ct.split(";")[0].trim() });
-          form.set("fileToUpload1", blob, `cover.${ext}`);
-        }
-      } catch {
-        // Cover is optional — continue without it
+    if (coverUrl) {
+      const cover = await resolveImageSource(coverUrl, "cover");
+      if (cover) {
+        form.set("fileToUpload1", cover.blob, cover.filename);
       }
     }
 
@@ -495,16 +488,30 @@ export class WebypostClient {
   }
 
   /**
-   * Publish a text status/post via poscode.php (AJAX JSON).
-   * Maps MCP `title` → titles, `content` → name (body field used by Webypost compose).
+   * Publish a status/feed post via poscode.php (AJAX JSON).
+   * Optional imageUrls → multipart fileToUpload1[] (max 8), same as the web compose UI.
    */
   async publishPost(
-    title: string,
-    content: string,
+    titleOrInput: string | PublishPostInput,
+    content?: string,
     privacy: "Public" | "Private" | "Friends" = config.defaultPrivacy
   ): Promise<PublishResult> {
-    const body = (content || "").trim();
-    const postTitle = (title || "").trim();
+    const input: PublishPostInput =
+      typeof titleOrInput === "string"
+        ? {
+            title: titleOrInput,
+            content: content ?? "",
+            privacy,
+          }
+        : titleOrInput;
+
+    const body = (input.content || "").trim();
+    const postTitle = (input.title || "").trim();
+    const usePrivacy = input.privacy ?? config.defaultPrivacy;
+    const imageUrls = (input.imageUrls || [])
+      .map((u) => String(u || "").trim())
+      .filter(Boolean)
+      .slice(0, 8);
 
     if (!body) {
       return {
@@ -524,23 +531,58 @@ export class WebypostClient {
       };
     }
 
-    const form = new URLSearchParams();
-    form.set("submit", "1");
+    // Always multipart when images are present (matches browser FormData + fileToUpload1[])
+    const form = new FormData();
+    form.set("submit", "Post");
     form.set("wp_ajax", "1");
     form.set("name", body);
     form.set("titles", postTitle);
-    form.set("privacy", privacy);
+    form.set("privacy", usePrivacy);
     form.set("input", "");
 
+    let imagesAttached = 0;
+    const imageErrors: string[] = [];
+    for (let i = 0; i < imageUrls.length; i++) {
+      const resolved = await resolveImageSource(imageUrls[i], `photo${i + 1}`);
+      if (!resolved) {
+        imageErrors.push(`Could not load image ${i + 1}`);
+        continue;
+      }
+      // PHP expects fileToUpload1 or fileToUpload1[] — append as array field
+      form.append("fileToUpload1[]", resolved.blob, resolved.filename);
+      imagesAttached += 1;
+    }
+
+    if (imageUrls.length > 0 && imagesAttached === 0) {
+      return {
+        ok: false,
+        message:
+          "Could not download/decode any images. Pass public https image URLs (or data:image/…;base64,…) that this server can fetch. " +
+          (imageErrors[0] || ""),
+        account: this.account.id,
+        details: { imageErrors, requested: imageUrls.length },
+      };
+    }
+
     const postUrl = absUrl("/poscode.php");
-    const res = await this.http.post(postUrl, form.toString(), {
+    const res = await this.http.post(postUrl, form, {
       headers: {
-        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
         Accept: "application/json",
         "X-Requested-With": "XMLHttpRequest",
         Origin: config.webypostBaseUrl,
         Referer: absUrl("/home"),
       },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      transformRequest: [
+        (data, headers) => {
+          if (data instanceof FormData && headers) {
+            delete (headers as Record<string, unknown>)["Content-Type"];
+            delete (headers as Record<string, unknown>)["content-type"];
+          }
+          return data;
+        },
+      ],
     });
 
     const ct = String(res.headers["content-type"] || "");
@@ -563,7 +605,11 @@ export class WebypostClient {
           message: "Post published (legacy redirect response).",
           url: path ? absUrl(path.replace(/^\//, "")) : undefined,
           account: this.account.id,
-          details: { httpStatus: res.status, email: this.lastUserHint },
+          details: {
+            httpStatus: res.status,
+            email: this.lastUserHint,
+            images_attached: imagesAttached,
+          },
         };
       } else {
         data = { raw: text.slice(0, 400) };
@@ -581,7 +627,7 @@ export class WebypostClient {
           details: { httpStatus: res.status, data },
         };
       }
-      return this.publishPost(title, content, privacy);
+      return this.publishPost(input);
     }
 
     if (res.status >= 200 && res.status < 300 && data.success === true) {
@@ -601,10 +647,13 @@ export class WebypostClient {
         url,
         pid,
         slug: slug || undefined,
-        privacy: typeof data.privacy === "string" ? data.privacy : privacy,
+        privacy: typeof data.privacy === "string" ? data.privacy : usePrivacy,
         account: this.account.id,
         details: {
-          photo_count: data.photo_count ?? 0,
+          photo_count: data.photo_count ?? imagesAttached,
+          images_requested: imageUrls.length,
+          images_attached: imagesAttached,
+          image_warnings: imageErrors.length ? imageErrors : undefined,
           httpStatus: res.status,
           email: this.lastUserHint || this.account.email || null,
         },
@@ -623,6 +672,7 @@ export class WebypostClient {
       details: {
         httpStatus: res.status,
         response: data,
+        images_attached: imagesAttached,
       },
     };
   }
@@ -728,6 +778,79 @@ function stripHtml(html: string): string {
     .replace(/<[^>]+>/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function extFromMime(mime: string): string {
+  const m = (mime || "").toLowerCase();
+  if (m.includes("png")) return "png";
+  if (m.includes("webp")) return "webp";
+  if (m.includes("gif")) return "gif";
+  if (m.includes("jpeg") || m.includes("jpg")) return "jpg";
+  return "jpg";
+}
+
+/**
+ * Load an image from https URL or data:image/…;base64,… into a Blob for multipart upload.
+ */
+async function resolveImageSource(
+  source: string,
+  baseName: string
+): Promise<{ blob: Blob; filename: string } | null> {
+  const src = (source || "").trim();
+  if (!src) return null;
+
+  // data URL
+  const dataMatch = src.match(
+    /^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/
+  );
+  if (dataMatch) {
+    try {
+      const mime = dataMatch[1];
+      const b64 = dataMatch[2].replace(/\s+/g, "");
+      const buf = Buffer.from(b64, "base64");
+      if (buf.length < 32) return null;
+      const blob = new Blob([buf], { type: mime });
+      return { blob, filename: `${baseName}.${extFromMime(mime)}` };
+    } catch {
+      return null;
+    }
+  }
+
+  if (!/^https?:\/\//i.test(src)) return null;
+
+  try {
+    const imgRes = await axios.get(src, {
+      responseType: "arraybuffer",
+      timeout: Math.max(config.requestTimeoutMs, 60000),
+      headers: {
+        Accept: "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+        "User-Agent":
+          "WebypostMcpServer/1.0 (+https://webypost.com; image fetch)",
+      },
+      maxRedirects: 5,
+      validateStatus: () => true,
+    });
+    if (imgRes.status < 200 || imgRes.status >= 300 || !imgRes.data) {
+      return null;
+    }
+    const buf = Buffer.from(imgRes.data);
+    if (buf.length < 32) return null;
+    let mime = String(imgRes.headers["content-type"] || "image/jpeg")
+      .split(";")[0]
+      .trim();
+    if (!mime.startsWith("image/")) {
+      // sniff magic bytes
+      if (buf[0] === 0x89 && buf[1] === 0x50) mime = "image/png";
+      else if (buf[0] === 0xff && buf[1] === 0xd8) mime = "image/jpeg";
+      else if (buf[0] === 0x47 && buf[1] === 0x49) mime = "image/gif";
+      else if (buf.toString("ascii", 0, 4) === "RIFF") mime = "image/webp";
+      else mime = "image/jpeg";
+    }
+    const blob = new Blob([buf], { type: mime });
+    return { blob, filename: `${baseName}.${extFromMime(mime)}` };
+  } catch {
+    return null;
+  }
 }
 
 // silence unused in some builds

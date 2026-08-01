@@ -122,7 +122,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "publish_webypost_post",
-    "Log in to Webypost (if needed) and publish a text post as a chosen account. Provide title (optional), content (required), optional privacy, and optional account id.",
+    "Publish a Webypost status/feed post (with optional images). Workflow for illustrated posts: (1) generate image(s) with Grok Imagine, (2) pass the public https image URL(s) in imageUrls, (3) call this tool. Supports up to 8 images. Also accepts data:image/…;base64,… URLs.",
     {
       title: z
         .string()
@@ -141,9 +141,22 @@ export function createMcpServer(): McpServer {
         .describe(
           "Optional privacy. Defaults to WEBYPOST_DEFAULT_PRIVACY or Public."
         ),
+      imageUrls: z
+        .array(z.string())
+        .max(8)
+        .optional()
+        .describe(
+          "Optional list of image URLs to attach (max 8). Use public https links from Grok Imagine / CDN, or data:image/png;base64,… strings. Server downloads them and uploads to Webypost as post photos."
+        ),
+      imageUrl: z
+        .string()
+        .optional()
+        .describe(
+          "Optional single image URL (shorthand for imageUrls with one item)."
+        ),
       account: accountArg,
     },
-    async ({ title, content, privacy, account }) => {
+    async ({ title, content, privacy, imageUrls, imageUrl, account }) => {
       try {
         if (account && !resolveAccount(account)) {
           return textResult(
@@ -156,12 +169,17 @@ export function createMcpServer(): McpServer {
             true
           );
         }
+        const urls = [
+          ...(imageUrls || []),
+          ...(imageUrl ? [imageUrl] : []),
+        ].filter(Boolean);
         const client = getClientForAccount(account);
-        const result = await client.publishPost(
-          title ?? "",
+        const result = await client.publishPost({
+          title: title ?? "",
           content,
-          privacy ?? config.defaultPrivacy
-        );
+          privacy: privacy ?? config.defaultPrivacy,
+          imageUrls: urls.length ? urls : undefined,
+        });
         return textResult(
           {
             tool: "publish_webypost_post",
@@ -183,7 +201,7 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "publish_webypost_article",
-    "Publish a long-form Webypost ARTICLE (not a short status post) via the article editor. Use for full articles with title + body. Optional category, subcategory, SEO fields, cover image URL, privacy, and account.",
+    "Publish a long-form Webypost ARTICLE (not a short status post). For a cover image: generate with Grok Imagine first, then pass coverImageUrl (public https or data:image/…;base64,…). Also accepts title, body HTML, category, subcategory, SEO fields, privacy, account.",
     {
       title: z
         .string()

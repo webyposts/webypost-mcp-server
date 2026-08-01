@@ -1,0 +1,25 @@
+# Render Blueprint — permanent public MCP URL for Grok
+# https://dashboard.render.com → New → Blueprint → connect this repo
+services:
+  - type: web
+    name: webypost-mcp-server
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HOST
+        value: 0.0.0.0
+      # PORT is set automatically by Render
+      - key: WEBYPOST_BASE_URL
+        value: https://webypost.com
+      - key: WEBYPOST_EMAIL
+        sync: false
+      - key: WEBYPOST_PASSWORD
+        sync: false
+      - key: WEBYPOST_DEFAULT_PRIVACY
+        value: Public

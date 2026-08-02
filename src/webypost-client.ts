@@ -90,8 +90,10 @@ export function extractEmbeddedImages(text: string): {
 
 export type ContentDirectives = {
   cleanText: string;
-  /** status (default) or article — full editor publish */
-  mode: "status" | "article";
+  /** status | article (create) | update (peditor edit) */
+  mode: "status" | "article" | "update";
+  /** Required for mode=update — browse article id */
+  articleId?: number;
   coverImageUrl?: string;
   category?: string;
   subcategory?: string;
@@ -105,21 +107,20 @@ export type ContentDirectives = {
  * Directives for clients that only expose title/content/privacy/account
  * (e.g. Grok frozen MCP connectors that never reload new tools).
  *
- * Put these on their own lines (stripped from final body):
+ * Create article:
  *   [[MODE:article]]
  *   [[COVER:https://…]]
- *   [[CATEGORY:Tech Reviews & Gadgets]]
- *   [[SUBCATEGORY:Upcoming Tech Launches]]
- *   [[METADESC:SEO blurb]]
- *   [[KEYWORDS:ai, tech]]
- *   [[TAGS:news, ai]]
- *   [[IMAGE:https://…]]   (status photos; also ok as extra)
  *
- * Body after markers may be HTML for articles.
+ * Update existing article (peditor):
+ *   [[MODE:update]]
+ *   [[ARTICLE_ID:231]]
+ *   [[COVER:https://…]]   optional new cover; omit to keep current
+ *   HTML body…
  */
 export function extractContentDirectives(text: string): ContentDirectives {
   let clean = text || "";
-  let mode: "status" | "article" = "status";
+  let mode: "status" | "article" | "update" = "status";
+  let articleId: number | undefined;
   let coverImageUrl: string | undefined;
   let category: string | undefined;
   let subcategory: string | undefined;
@@ -135,14 +136,36 @@ export function extractContentDirectives(text: string): ContentDirectives {
     });
   };
 
-  take(/\[\[\s*mode\s*:\s*(article|status|post|story)\s*\]\]/gi, (v) => {
-    const x = v.toLowerCase();
-    mode = x === "article" ? "article" : "status";
+  take(
+    /\[\[\s*mode\s*:\s*(article|status|post|story|update|edit|revise)\s*\]\]/gi,
+    (v) => {
+      const x = v.toLowerCase();
+      if (x === "article") mode = "article";
+      else if (x === "update" || x === "edit" || x === "revise") mode = "update";
+      else mode = "status";
+    }
+  );
+  take(
+    /^\s*(?:TYPE|POST_TYPE|MODE)\s*[=:]\s*(article|status|post|update|edit)\s*$/gim,
+    (v) => {
+      const x = v.toLowerCase();
+      if (x === "article") mode = "article";
+      else if (x === "update" || x === "edit") mode = "update";
+      else mode = "status";
+    }
+  );
+
+  take(/\[\[\s*(?:article_id|articleid|pid|id)\s*:\s*(\d+)\s*\]\]/gi, (v) => {
+    const n = Number.parseInt(v, 10);
+    if (Number.isFinite(n) && n > 0) articleId = n;
   });
-  // Also: TYPE:article / POST_TYPE=article
-  take(/^\s*(?:TYPE|POST_TYPE|MODE)\s*[=:]\s*(article|status|post)\s*$/gim, (v) => {
-    mode = v.toLowerCase() === "article" ? "article" : "status";
-  });
+  take(
+    /^\s*(?:ARTICLE_ID|PID|EDIT_ID)\s*[=:]\s*(\d+)\s*$/gim,
+    (v) => {
+      const n = Number.parseInt(v, 10);
+      if (Number.isFinite(n) && n > 0) articleId = n;
+    }
+  );
 
   take(
     /\[\[\s*cover\s*:\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+|https?:\/\/[^\]\s]+)\s*\]\]/gi,
@@ -176,9 +199,15 @@ export function extractContentDirectives(text: string): ContentDirectives {
   const imgs = extractEmbeddedImages(clean);
   clean = imgs.cleanText.replace(/\n{3,}/g, "\n\n").trim();
 
+  // If article id present without explicit mode, treat as update
+  if (articleId && mode === "status") {
+    mode = "update";
+  }
+
   return {
     cleanText: clean,
     mode,
+    articleId,
     coverImageUrl,
     category,
     subcategory,
@@ -205,9 +234,13 @@ export type PublishArticleInput = {
   tags?: string;
   /**
    * Optional cover image URL (https or data:image/…;base64,…).
-   * Downloaded and uploaded as fileToUpload1.
+   * Downloaded and uploaded as featured cover (cropdata).
    */
   coverImageUrl?: string;
+  /**
+   * If set, UPDATE existing article via peditor.php instead of creating.
+   */
+  articleId?: number;
 };
 
 function isJsonContentType(ct: string | undefined): boolean {
@@ -609,8 +642,13 @@ export class WebypostClient {
    * Publish a long-form article via editor.php (AJAX JSON, same as web editor).
    * Maps: title→title, content→teaser, category→department, subcategory→subc.
    * External body images are re-hosted to Webypost upload/ before save.
+   * If input.articleId is set, updates via peditor.php instead.
    */
   async publishArticle(input: PublishArticleInput): Promise<PublishResult> {
+    if (input.articleId && input.articleId > 0) {
+      return this.updateArticle(input);
+    }
+
     const title = (input.title || "").trim();
     let body = (input.content || "").trim();
     const privacy = input.privacy ?? config.defaultPrivacy;
@@ -838,6 +876,245 @@ export class WebypostClient {
       account: this.account.id,
       details: {
         type: "article",
+        httpStatus: res.status,
+        response: data,
+        cover: coverStatus,
+        body_images_rehosted: bodyRehost.rehosted,
+        body_images_failed: bodyRehost.failed.length
+          ? bodyRehost.failed
+          : undefined,
+      },
+    };
+  }
+
+  /**
+   * Update an existing article via peditor.php (same fields as editor + update flag).
+   * Re-hosts body images; optional new cover via cropdata. Omitting cover keeps current.
+   */
+  async updateArticle(input: PublishArticleInput): Promise<PublishResult> {
+    const articleId = Number(input.articleId) || 0;
+    const title = (input.title || "").trim();
+    let body = (input.content || "").trim();
+    const privacy = input.privacy ?? config.defaultPrivacy;
+
+    if (articleId < 1) {
+      return {
+        ok: false,
+        message: "articleId is required to update (e.g. [[ARTICLE_ID:231]]).",
+        account: this.account.id,
+      };
+    }
+    if (!title) {
+      return {
+        ok: false,
+        message: "title is required when updating an article.",
+        account: this.account.id,
+      };
+    }
+    if (!body) {
+      return {
+        ok: false,
+        message: "content is required when updating an article.",
+        account: this.account.id,
+      };
+    }
+
+    body = this.expandFigureMarkers(body);
+    if (!/<[a-z][\s\S]*>/i.test(body)) {
+      body = body
+        .split(/\n{2,}/)
+        .map((p) => p.trim())
+        .filter(Boolean)
+        .map((p) => `<p>${escapeHtml(p).replace(/\n/g, "<br>")}</p>`)
+        .join("\n");
+    }
+
+    const authFail = await this.ensureAuth();
+    if (authFail) {
+      return {
+        ok: false,
+        message: `Login required before updating article: ${authFail.message}`,
+        account: this.account.id,
+        details: authFail.details,
+      };
+    }
+
+    let bodyRehost: { rehosted: number; failed: string[] } = {
+      rehosted: 0,
+      failed: [],
+    };
+    try {
+      const rh = await this.rehostHtmlBodyImages(body);
+      body = rh.html;
+      bodyRehost = { rehosted: rh.rehosted, failed: rh.failed };
+    } catch (e) {
+      bodyRehost = {
+        rehosted: 0,
+        failed: [e instanceof Error ? e.message : String(e)],
+      };
+    }
+
+    const category = (input.category || "").trim();
+    const subcategory = (input.subcategory || "").trim();
+    const keywords = (input.keywords || "").trim();
+    const tags = (input.tags || keywords).trim();
+    const metadesc =
+      (input.metadesc || "").trim() || stripHtml(body).slice(0, 155).trim();
+
+    const form = new FormData();
+    form.set("update", "1");
+    form.set("article_id", String(articleId));
+    form.set("pid", String(articleId));
+    form.set("title", title);
+    form.set("teaser", body);
+    form.set("metadesc", metadesc);
+    form.set("keyword", keywords);
+    form.set("input", tags);
+    form.set("privacy", privacy);
+    if (category) form.set("department", category);
+    if (subcategory) form.set("subc", subcategory);
+    form.set("cropdata", "");
+
+    const coverUrl = (input.coverImageUrl || "").trim();
+    let coverStatus: {
+      requested: boolean;
+      applied: boolean;
+      method?: string;
+      error?: string;
+      keptExisting?: boolean;
+    } = {
+      requested: Boolean(coverUrl),
+      applied: false,
+      keptExisting: !coverUrl,
+    };
+
+    if (coverUrl) {
+      try {
+        const cover = await resolveImageSource(coverUrl, "cover");
+        if (!cover) {
+          coverStatus.error =
+            "Could not download cover URL (must be public https image).";
+        } else {
+          const ab = await cover.blob.arrayBuffer();
+          const buf = Buffer.from(ab);
+          const mime =
+            cover.blob.type && cover.blob.type.startsWith("image/")
+              ? cover.blob.type.split(";")[0].trim()
+              : "image/jpeg";
+          form.set(
+            "cropdata",
+            `data:${mime};base64,${buf.toString("base64")}`
+          );
+          form.set("fileToUpload1", cover.blob, cover.filename);
+          coverStatus.applied = true;
+          coverStatus.method = "cropdata+file";
+          coverStatus.keptExisting = false;
+        }
+      } catch (e) {
+        coverStatus.error =
+          e instanceof Error ? e.message : "Cover processing failed";
+      }
+    }
+
+    const postUrl = absUrl(`/peditor.php?edit=${articleId}`);
+    const res = await this.http.post(postUrl, form, {
+      headers: {
+        Accept: "application/json",
+        "X-WP-Editor-Ajax": "1",
+        "X-Requested-With": "XMLHttpRequest",
+        Origin: config.webypostBaseUrl,
+        Referer: absUrl(`/peditor.php?edit=${articleId}`),
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      transformRequest: [
+        (data, headers) => {
+          if (data instanceof FormData && headers) {
+            delete (headers as Record<string, unknown>)["Content-Type"];
+            delete (headers as Record<string, unknown>)["content-type"];
+          }
+          return data;
+        },
+      ],
+    });
+
+    const ct = String(res.headers["content-type"] || "");
+    let data: Record<string, unknown> = {};
+    if (isJsonContentType(ct) && res.data && typeof res.data === "object") {
+      data = res.data as Record<string, unknown>;
+    } else if (typeof res.data === "string") {
+      const text = res.data.trim();
+      if (text.startsWith("{")) {
+        try {
+          data = JSON.parse(text) as Record<string, unknown>;
+        } catch {
+          data = { raw: text.slice(0, 400) };
+        }
+      } else {
+        data = { raw: text.slice(0, 400) };
+      }
+    }
+
+    if (res.status === 401 || data.error === "Not logged in") {
+      this.loggedIn = false;
+      const retryLogin = await this.login();
+      if (!retryLogin.ok) {
+        return {
+          ok: false,
+          message: `Session expired and re-login failed: ${retryLogin.message}`,
+          account: this.account.id,
+          details: { httpStatus: res.status, data },
+        };
+      }
+      return this.updateArticle(input);
+    }
+
+    if (res.status >= 200 && res.status < 300 && data.ok === true) {
+      const id = Number(data.id) || articleId;
+      let url =
+        typeof data.url === "string" && data.url ? data.url : undefined;
+      if (url && !/^https?:\/\//i.test(url)) {
+        url = absUrl(url.replace(/^\//, ""));
+      }
+      if (!url) {
+        url = absUrl(`article/${id}`);
+      }
+
+      return {
+        ok: true,
+        message: "Article updated",
+        url,
+        pid: id,
+        privacy,
+        account: this.account.id,
+        details: {
+          type: "article_update",
+          articleId: id,
+          category: category || undefined,
+          subcategory: subcategory || undefined,
+          httpStatus: res.status,
+          email: this.lastUserHint || this.account.email || null,
+          cover: coverStatus,
+          body_images_rehosted: bodyRehost.rehosted,
+          body_images_failed: bodyRehost.failed.length
+            ? bodyRehost.failed
+            : undefined,
+        },
+      };
+    }
+
+    const failMsg =
+      (typeof data.error === "string" && data.error) ||
+      (typeof data.message === "string" && data.message) ||
+      `Article update failed (HTTP ${res.status}). Use the author account that owns the article.`;
+
+    return {
+      ok: false,
+      message: failMsg,
+      account: this.account.id,
+      details: {
+        type: "article_update",
+        articleId,
         httpStatus: res.status,
         response: data,
         cover: coverStatus,

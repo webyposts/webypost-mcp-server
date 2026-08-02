@@ -280,6 +280,7 @@ export function createMcpServer(): McpServer {
     privacy?: "Public" | "Private" | "Friends";
     account?: string;
     mode?: string;
+    articleId?: string | number;
     imageUrl?: string;
     imageUrls?: string;
     coverImageUrl?: string;
@@ -303,11 +304,90 @@ export function createMcpServer(): McpServer {
 
     const dir = extractContentDirectives(args.content);
     const modeRaw = (args.mode || dir.mode || "status").toLowerCase();
+    const articleIdNum =
+      Number(args.articleId) ||
+      dir.articleId ||
+      0;
+    const isUpdate =
+      modeRaw === "update" ||
+      modeRaw === "edit" ||
+      modeRaw === "revise" ||
+      (articleIdNum > 0 &&
+        (modeRaw === "article" || modeRaw === "update" || modeRaw === "edit"));
     const isArticle =
-      modeRaw === "article" || modeRaw === "editor" || modeRaw === "longform";
+      modeRaw === "article" ||
+      modeRaw === "editor" ||
+      modeRaw === "longform" ||
+      isUpdate;
 
     const privacy = args.privacy ?? config.defaultPrivacy;
     const client = getClientForAccount(args.account);
+
+    if (isUpdate || (isArticle && articleIdNum > 0)) {
+      const title = (args.title || "").trim();
+      if (!title) {
+        return textResult(
+          {
+            tool: args.toolName,
+            ok: false,
+            message:
+              "Article UPDATE needs title + [[MODE:update]] + [[ARTICLE_ID:123]] (or articleId param).",
+          },
+          true
+        );
+      }
+      if (articleIdNum < 1) {
+        return textResult(
+          {
+            tool: args.toolName,
+            ok: false,
+            message:
+              "Article UPDATE needs [[ARTICLE_ID:123]] or articleId=123 (the pid from the article URL).",
+          },
+          true
+        );
+      }
+      const body = dir.cleanText;
+      if (!body) {
+        return textResult(
+          {
+            tool: args.toolName,
+            ok: false,
+            message:
+              "Article body is empty after markers. Put full HTML body after [[MODE:update]] / [[ARTICLE_ID:…]].",
+          },
+          true
+        );
+      }
+      const cover =
+        (args.coverImageUrl || "").trim() ||
+        dir.coverImageUrl ||
+        undefined;
+
+      const result = await client.updateArticle({
+        articleId: articleIdNum,
+        title,
+        content: body,
+        privacy,
+        category: args.category || dir.category,
+        subcategory: args.subcategory || dir.subcategory,
+        metadesc: args.metadesc || dir.metadesc,
+        keywords: args.keywords || dir.keywords,
+        tags: args.tags || dir.tags,
+        coverImageUrl: cover,
+      });
+      return textResult(
+        {
+          tool: args.toolName,
+          mode: "update",
+          ...result,
+          hint: result.ok
+            ? "Updated existing ARTICLE via peditor. URL should still contain /article/."
+            : undefined,
+        },
+        !result.ok
+      );
+    }
 
     if (isArticle) {
       const title = (args.title || "").trim();
@@ -385,19 +465,19 @@ export function createMcpServer(): McpServer {
 
   server.tool(
     "publish_webypost_post",
-    "UNIVERSAL Webypost publisher (status OR full ARTICLE). Works with frozen Grok connectors that only expose title/content/privacy/account. STATUS: plain text + optional [[IMAGE:https://…]]. ARTICLE (rich HTML via editor): put [[MODE:article]] in content, HTML body, optional [[COVER:https://…]] [[CATEGORY:…]] [[SUBCATEGORY:…]]. Also accepts mode=article and coverImageUrl when the client exposes those fields. Server uploads images and stores paths — do not put binary in the DB.",
+    "UNIVERSAL Webypost publisher: status post, CREATE article, or UPDATE article (peditor). STATUS: text + [[IMAGE:https://…]]. CREATE article: [[MODE:article]] + HTML + [[COVER:…]]. UPDATE article: [[MODE:update]] + [[ARTICLE_ID:231]] + full HTML body; optional new [[COVER:…]] (omit cover to keep current). Body images re-hosted. Works with frozen Grok title/content/privacy/account schemas.",
     {
       content: z
         .string()
         .min(1)
         .describe(
-          "Body text OR HTML. Markers: [[MODE:article]]; [[COVER:https://…]] cover upload; [[CATEGORY:]]; [[SUBCATEGORY:]]; [[IMAGE:https://…]] status photos; [[FIGURE:https://…|caption]] body figure (re-hosted); [[METADESC:]]; [[KEYWORDS:]]. Article HTML <img src=\"https://…\"> is re-uploaded to webypost.com/upload/ before save (max 15). Use public https URLs."
+          "Body text OR HTML. Markers: [[MODE:article]] create; [[MODE:update]] edit via peditor; [[ARTICLE_ID:123]] required for update; [[COVER:https://…]] cover (create or replace); [[CATEGORY:]]; [[SUBCATEGORY:]]; [[FIGURE:https://…|caption]] body image (re-hosted); [[IMAGE:https://…]] status photos; [[METADESC:]]; [[KEYWORDS:]]. HTML <img src> also re-hosted on create/update (max 15)."
         ),
       title: z
         .string()
         .optional()
         .describe(
-          "Title. Required for articles (mode=article). Optional for status posts."
+          "Title. Required for article create and update. Optional for status posts."
         ),
       privacy: privacyArg,
       account: accountArg,
@@ -405,7 +485,13 @@ export function createMcpServer(): McpServer {
         .string()
         .optional()
         .describe(
-          'Publish mode: "status" (default feed post) or "article" (full editor /article/ URL). Prefer [[MODE:article]] in content if this field is missing.'
+          'Mode: "status" | "article" (create) | "update" (edit peditor). Prefer [[MODE:update]] + [[ARTICLE_ID:n]] in content if this field is missing.'
+        ),
+      articleId: z
+        .union([z.string(), z.number()])
+        .optional()
+        .describe(
+          "Existing article id (pid) for updates. Or use [[ARTICLE_ID:231]] in content."
         ),
       imageUrl: z
         .string()
@@ -442,6 +528,83 @@ export function createMcpServer(): McpServer {
       } catch (err) {
         return textResult(
           { tool: "publish_webypost_post", ...safePublishError(err) },
+          true
+        );
+      }
+    }
+  );
+
+  server.tool(
+    "update_webypost_article",
+    "Update an existing Webypost ARTICLE via peditor (title, HTML body, privacy, category, optional new cover, body images re-hosted). Requires articleId (pid from /article/URL).",
+    {
+      articleId: z
+        .union([z.string(), z.number()])
+        .describe("Existing article id / pid (e.g. 231 from …/article/231)."),
+      title: z.string().min(1).describe("Updated article title."),
+      content: z
+        .string()
+        .min(1)
+        .describe(
+          "Full updated HTML body. External <img> and [[FIGURE:url|cap]] are re-hosted."
+        ),
+      privacy: privacyArg,
+      account: accountArg,
+      coverImageUrl: z
+        .string()
+        .optional()
+        .describe(
+          "Optional NEW cover https URL. Omit to keep the current cover."
+        ),
+      category: z.string().optional(),
+      subcategory: z.string().optional(),
+      metadesc: z.string().optional(),
+      keywords: z.string().optional(),
+      tags: z.string().optional(),
+    },
+    async (args) => {
+      try {
+        if (args.account && !resolveAccount(args.account)) {
+          return textResult(
+            {
+              tool: "update_webypost_article",
+              ok: false,
+              message: `Unknown account. Known: ${listAccountIds().join(", ")}`,
+            },
+            true
+          );
+        }
+        const id = Number(args.articleId);
+        if (!Number.isFinite(id) || id < 1) {
+          return textResult(
+            {
+              tool: "update_webypost_article",
+              ok: false,
+              message: "articleId must be a positive number.",
+            },
+            true
+          );
+        }
+        const client = getClientForAccount(args.account);
+        const result = await client.updateArticle({
+          articleId: id,
+          title: args.title,
+          content: args.content,
+          privacy: args.privacy ?? config.defaultPrivacy,
+          coverImageUrl: args.coverImageUrl,
+          category: args.category,
+          subcategory: args.subcategory,
+          metadesc: args.metadesc,
+          keywords: args.keywords,
+          tags: args.tags,
+        });
+        return textResult(
+          { tool: "update_webypost_article", mode: "update", ...result },
+          !result.ok
+        );
+      } catch (err) {
+        return textResult(
+          { tool: "update_webypost_article", ...safePublishError(err) },
           true
         );
       }

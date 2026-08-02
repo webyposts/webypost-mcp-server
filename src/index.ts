@@ -65,11 +65,19 @@ app.get("/health", (_req: Request, res: Response) => {
       "publish_webypost_post",
       "publish_webypost_with_image",
       "publish_webypost_article",
+      "update_webypost_article",
     ],
     imageParams: {
-      publish_webypost_post: ["imageUrl", "imageUrls"],
+      publish_webypost_post: [
+        "imageUrl",
+        "imageUrls",
+        "[[COVER:]]",
+        "[[FIGURE:]]",
+        "[[MODE:update]]+[[ARTICLE_ID:]]",
+      ],
       publish_webypost_with_image: ["imageUrl (required)"],
       publish_webypost_article: ["coverImageUrl"],
+      update_webypost_article: ["coverImageUrl", "body img rehost"],
     },
     transports: {
       streamableHttp: "/mcp",

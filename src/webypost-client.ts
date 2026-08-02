@@ -697,12 +697,42 @@ export class WebypostClient {
     form.set("subc", subcategory);
     form.set("cropdata", "");
 
-    // Optional cover image
+    // Optional cover image — prefer cropdata (same as browser cropper), which
+    // PHP prioritizes over raw fileToUpload1 and works more reliably behind proxies.
     const coverUrl = (input.coverImageUrl || "").trim();
+    let coverStatus: {
+      requested: boolean;
+      applied: boolean;
+      method?: string;
+      error?: string;
+    } = { requested: Boolean(coverUrl), applied: false };
+
     if (coverUrl) {
-      const cover = await resolveImageSource(coverUrl, "cover");
-      if (cover) {
-        form.set("fileToUpload1", cover.blob, cover.filename);
+      try {
+        const cover = await resolveImageSource(coverUrl, "cover");
+        if (!cover) {
+          coverStatus.error =
+            "Could not download cover URL (must be public https image).";
+        } else {
+          const ab = await cover.blob.arrayBuffer();
+          const buf = Buffer.from(ab);
+          const mime =
+            cover.blob.type && cover.blob.type.startsWith("image/")
+              ? cover.blob.type.split(";")[0].trim()
+              : "image/jpeg";
+          // Webypost article_cover_helpers prefers cropdata over file upload
+          form.set(
+            "cropdata",
+            `data:${mime};base64,${buf.toString("base64")}`
+          );
+          // Also send file field as fallback
+          form.set("fileToUpload1", cover.blob, cover.filename);
+          coverStatus.applied = true;
+          coverStatus.method = "cropdata+file";
+        }
+      } catch (e) {
+        coverStatus.error =
+          e instanceof Error ? e.message : "Cover processing failed";
       }
     }
 
@@ -788,6 +818,7 @@ export class WebypostClient {
           subcategory,
           httpStatus: res.status,
           email: this.lastUserHint || this.account.email || null,
+          cover: coverStatus,
           body_images_rehosted: bodyRehost.rehosted,
           body_images_failed: bodyRehost.failed.length
             ? bodyRehost.failed
@@ -809,6 +840,7 @@ export class WebypostClient {
         type: "article",
         httpStatus: res.status,
         response: data,
+        cover: coverStatus,
         body_images_rehosted: bodyRehost.rehosted,
         body_images_failed: bodyRehost.failed.length
           ? bodyRehost.failed

@@ -88,6 +88,107 @@ export function extractEmbeddedImages(text: string): {
   return { cleanText: clean, imageUrls: [...new Set(urls)].slice(0, 8) };
 }
 
+export type ContentDirectives = {
+  cleanText: string;
+  /** status (default) or article — full editor publish */
+  mode: "status" | "article";
+  coverImageUrl?: string;
+  category?: string;
+  subcategory?: string;
+  metadesc?: string;
+  keywords?: string;
+  tags?: string;
+  imageUrls: string[];
+};
+
+/**
+ * Directives for clients that only expose title/content/privacy/account
+ * (e.g. Grok frozen MCP connectors that never reload new tools).
+ *
+ * Put these on their own lines (stripped from final body):
+ *   [[MODE:article]]
+ *   [[COVER:https://…]]
+ *   [[CATEGORY:Tech Reviews & Gadgets]]
+ *   [[SUBCATEGORY:Upcoming Tech Launches]]
+ *   [[METADESC:SEO blurb]]
+ *   [[KEYWORDS:ai, tech]]
+ *   [[TAGS:news, ai]]
+ *   [[IMAGE:https://…]]   (status photos; also ok as extra)
+ *
+ * Body after markers may be HTML for articles.
+ */
+export function extractContentDirectives(text: string): ContentDirectives {
+  let clean = text || "";
+  let mode: "status" | "article" = "status";
+  let coverImageUrl: string | undefined;
+  let category: string | undefined;
+  let subcategory: string | undefined;
+  let metadesc: string | undefined;
+  let keywords: string | undefined;
+  let tags: string | undefined;
+
+  const take = (re: RegExp, assign: (v: string) => void) => {
+    clean = clean.replace(re, (_m, v: string) => {
+      const s = String(v || "").trim();
+      if (s) assign(s);
+      return "";
+    });
+  };
+
+  take(/\[\[\s*mode\s*:\s*(article|status|post|story)\s*\]\]/gi, (v) => {
+    const x = v.toLowerCase();
+    mode = x === "article" ? "article" : "status";
+  });
+  // Also: TYPE:article / POST_TYPE=article
+  take(/^\s*(?:TYPE|POST_TYPE|MODE)\s*[=:]\s*(article|status|post)\s*$/gim, (v) => {
+    mode = v.toLowerCase() === "article" ? "article" : "status";
+  });
+
+  take(
+    /\[\[\s*cover\s*:\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+|https?:\/\/[^\]\s]+)\s*\]\]/gi,
+    (v) => {
+      coverImageUrl = v.replace(/\s+/g, "");
+    }
+  );
+  take(
+    /^\s*COVER(?:_URL)?\s*[=:]\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+|https?:\/\/\S+)\s*$/gim,
+    (v) => {
+      coverImageUrl = v.replace(/\s+/g, "");
+    }
+  );
+
+  take(/\[\[\s*category\s*:\s*([^\]]+)\]\]/gi, (v) => {
+    category = v;
+  });
+  take(/\[\[\s*subcategory\s*:\s*([^\]]+)\]\]/gi, (v) => {
+    subcategory = v;
+  });
+  take(/\[\[\s*metadesc\s*:\s*([^\]]+)\]\]/gi, (v) => {
+    metadesc = v;
+  });
+  take(/\[\[\s*keywords?\s*:\s*([^\]]+)\]\]/gi, (v) => {
+    keywords = v;
+  });
+  take(/\[\[\s*tags?\s*:\s*([^\]]+)\]\]/gi, (v) => {
+    tags = v;
+  });
+
+  const imgs = extractEmbeddedImages(clean);
+  clean = imgs.cleanText.replace(/\n{3,}/g, "\n\n").trim();
+
+  return {
+    cleanText: clean,
+    mode,
+    coverImageUrl,
+    category,
+    subcategory,
+    metadesc,
+    keywords,
+    tags,
+    imageUrls: imgs.imageUrls,
+  };
+}
+
 export type PublishArticleInput = {
   title: string;
   content: string;

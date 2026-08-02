@@ -10,6 +10,7 @@ import { config, listAccountIds, resolveAccount } from "./config.js";
 import {
   getClientForAccount,
   safePublishError,
+  extractContentDirectives,
 } from "./webypost-client.js";
 
 function textResult(payload: unknown, isError = false) {
@@ -268,44 +269,174 @@ export function createMcpServer(): McpServer {
     );
   }
 
+  /**
+   * Universal publish entry — works even when the client only knows
+   * publish_webypost_post with title/content/privacy/account (Grok frozen schemas).
+   * Routes to article editor when mode=article or [[MODE:article]] is in content.
+   */
+  async function publishUniversal(args: {
+    title?: string;
+    content: string;
+    privacy?: "Public" | "Private" | "Friends";
+    account?: string;
+    mode?: string;
+    imageUrl?: string;
+    imageUrls?: string;
+    coverImageUrl?: string;
+    category?: string;
+    subcategory?: string;
+    metadesc?: string;
+    keywords?: string;
+    tags?: string;
+    toolName: string;
+  }) {
+    if (args.account && !resolveAccount(args.account)) {
+      return textResult(
+        {
+          tool: args.toolName,
+          ok: false,
+          message: `Unknown account "${args.account}". Known: ${listAccountIds().join(", ")}`,
+        },
+        true
+      );
+    }
+
+    const dir = extractContentDirectives(args.content);
+    const modeRaw = (args.mode || dir.mode || "status").toLowerCase();
+    const isArticle =
+      modeRaw === "article" || modeRaw === "editor" || modeRaw === "longform";
+
+    const privacy = args.privacy ?? config.defaultPrivacy;
+    const client = getClientForAccount(args.account);
+
+    if (isArticle) {
+      const title = (args.title || "").trim();
+      if (!title) {
+        return textResult(
+          {
+            tool: args.toolName,
+            ok: false,
+            message:
+              "Article mode needs a title. Pass title=… and put [[MODE:article]] in content (or mode=article).",
+          },
+          true
+        );
+      }
+      const body = dir.cleanText;
+      if (!body) {
+        return textResult(
+          {
+            tool: args.toolName,
+            ok: false,
+            message: "Article body is empty after removing markers. Put HTML after [[MODE:article]].",
+          },
+          true
+        );
+      }
+      const cover =
+        (args.coverImageUrl || "").trim() ||
+        dir.coverImageUrl ||
+        dir.imageUrls[0] ||
+        parseImageUrlList(args.imageUrl, args.imageUrls)[0];
+
+      const result = await client.publishArticle({
+        title,
+        content: body,
+        privacy,
+        category: args.category || dir.category,
+        subcategory: args.subcategory || dir.subcategory,
+        metadesc: args.metadesc || dir.metadesc,
+        keywords: args.keywords || dir.keywords,
+        tags: args.tags || dir.tags,
+        coverImageUrl: cover,
+      });
+      return textResult(
+        {
+          tool: args.toolName,
+          mode: "article",
+          ...result,
+          hint: result.ok
+            ? "Published as ARTICLE (editor). URL should contain /article/."
+            : undefined,
+        },
+        !result.ok
+      );
+    }
+
+    // Status / feed post
+    const extraUrls = parseImageUrlList(args.imageUrl, args.imageUrls);
+    const allImages = [...dir.imageUrls, ...extraUrls];
+    const result = await client.publishPost({
+      title: args.title ?? "",
+      content: dir.cleanText,
+      privacy,
+      imageUrls: allImages.length ? allImages : undefined,
+    });
+    return textResult(
+      {
+        tool: args.toolName,
+        mode: "status",
+        ...result,
+        imagesRequested: allImages.length,
+      },
+      !result.ok
+    );
+  }
+
   server.tool(
     "publish_webypost_post",
-    "Publish a Webypost status/feed post. SUPPORTS IMAGES even if only text fields are visible: put [[IMAGE:https://public-url.jpg]] on its own line inside content (or IMAGE_URL=https://...). Also accepts imageUrl param when the client exposes it. Server downloads the image and attaches it as a post photo.",
+    "UNIVERSAL Webypost publisher (status OR full ARTICLE). Works with frozen Grok connectors that only expose title/content/privacy/account. STATUS: plain text + optional [[IMAGE:https://…]]. ARTICLE (rich HTML via editor): put [[MODE:article]] in content, HTML body, optional [[COVER:https://…]] [[CATEGORY:…]] [[SUBCATEGORY:…]]. Also accepts mode=article and coverImageUrl when the client exposes those fields. Server uploads images and stores paths — do not put binary in the DB.",
     {
       content: z
         .string()
         .min(1)
         .describe(
-          "Required post body. To attach a photo, include a line: [[IMAGE:https://YOUR_PUBLIC_IMAGE_URL]] or [[IMAGE:data:image/png;base64,XXXX]]. Markers are removed from the visible post text. Use a public https image URL (CDN, Imgur, your site, etc.)."
+          "Body text OR HTML. Markers (own lines, stripped after parse): [[MODE:article]] for editor articles; [[COVER:https://…]] cover; [[CATEGORY:…]]; [[SUBCATEGORY:…]]; [[IMAGE:https://…]] status photos; [[METADESC:…]]; [[KEYWORDS:…]]. For articles use HTML e.g. <p>…</p><h2>…</h2>."
         ),
       title: z
         .string()
         .optional()
-        .describe("Optional short title. Can also contain [[IMAGE:url]] markers."),
+        .describe(
+          "Title. Required for articles (mode=article). Optional for status posts."
+        ),
       privacy: privacyArg,
+      account: accountArg,
+      mode: z
+        .string()
+        .optional()
+        .describe(
+          'Publish mode: "status" (default feed post) or "article" (full editor /article/ URL). Prefer [[MODE:article]] in content if this field is missing.'
+        ),
       imageUrl: z
         .string()
         .optional()
-        .describe(
-          "Optional public https image URL or data:image/…;base64,… (if your client exposes this field)."
-        ),
+        .describe("Optional status photo URL (public https)."),
       imageUrls: z
         .string()
         .optional()
+        .describe("Optional extra status photo URLs (comma/newline separated)."),
+      coverImageUrl: z
+        .string()
+        .optional()
         .describe(
-          "Optional extra image URLs as one string (comma or newline separated)."
+          "Optional article cover URL. Or use [[COVER:https://…]] in content."
         ),
-      account: accountArg,
+      category: z
+        .string()
+        .optional()
+        .describe('Article category e.g. "Tech Reviews & Gadgets".'),
+      subcategory: z
+        .string()
+        .optional()
+        .describe('Article subcategory e.g. "Upcoming Tech Launches".'),
+      metadesc: z.string().optional().describe("Article SEO meta description."),
+      keywords: z.string().optional().describe("Article SEO keywords."),
+      tags: z.string().optional().describe("Article tags."),
     },
-    async ({ content, title, privacy, imageUrl, imageUrls, account }) => {
+    async (args) => {
       try {
-        return await publishStatus({
-          content,
-          title,
-          privacy,
-          imageUrl,
-          imageUrls,
-          account,
+        return await publishUniversal({
+          ...args,
           toolName: "publish_webypost_post",
         });
       } catch (err) {

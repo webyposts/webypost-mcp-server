@@ -391,7 +391,7 @@ export function createMcpServer(): McpServer {
         .string()
         .min(1)
         .describe(
-          "Body text OR HTML. Markers (own lines, stripped after parse): [[MODE:article]] for editor articles; [[COVER:https://…]] cover; [[CATEGORY:…]]; [[SUBCATEGORY:…]]; [[IMAGE:https://…]] status photos; [[METADESC:…]]; [[KEYWORDS:…]]. For articles use HTML e.g. <p>…</p><h2>…</h2>."
+          "Body text OR HTML. Markers: [[MODE:article]]; [[COVER:https://…]] cover upload; [[CATEGORY:]]; [[SUBCATEGORY:]]; [[IMAGE:https://…]] status photos; [[FIGURE:https://…|caption]] body figure (re-hosted); [[METADESC:]]; [[KEYWORDS:]]. Article HTML <img src=\"https://…\"> is re-uploaded to webypost.com/upload/ before save (max 15). Use public https URLs."
         ),
       title: z
         .string()

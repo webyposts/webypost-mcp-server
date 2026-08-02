@@ -443,8 +443,172 @@ export class WebypostClient {
   }
 
   /**
+   * Upload one image via Webypost editor endpoint (CKEditor simpleUpload → upload.php).
+   * Returns absolute hosted URL on success.
+   */
+  private async uploadImageToWebypost(
+    blob: Blob,
+    filename: string
+  ): Promise<string | null> {
+    const form = new FormData();
+    form.append("upload", blob, filename);
+    const res = await this.http.post(absUrl("/upload.php"), form, {
+      headers: {
+        Accept: "application/json, text/plain, */*",
+        "X-Requested-With": "XMLHttpRequest",
+        Origin: config.webypostBaseUrl,
+        Referer: absUrl("/editor.php"),
+      },
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      transformRequest: [
+        (data, headers) => {
+          if (data instanceof FormData && headers) {
+            delete (headers as Record<string, unknown>)["Content-Type"];
+            delete (headers as Record<string, unknown>)["content-type"];
+          }
+          return data;
+        },
+      ],
+    });
+
+    let data: Record<string, unknown> = {};
+    if (res.data && typeof res.data === "object") {
+      data = res.data as Record<string, unknown>;
+    } else if (typeof res.data === "string") {
+      try {
+        data = JSON.parse(res.data) as Record<string, unknown>;
+      } catch {
+        data = {};
+      }
+    }
+
+    // CKEditor / upload.php shapes: { url }, { urls: { default } }, { uploaded:1, url }
+    let path = "";
+    if (typeof data.url === "string" && data.url.trim()) {
+      path = data.url.trim();
+    } else if (data.urls && typeof data.urls === "object") {
+      const def = (data.urls as Record<string, unknown>).default;
+      if (typeof def === "string" && def.trim()) path = def.trim();
+    } else if (typeof data.file === "string" && data.file.trim()) {
+      path = `upload/${data.file.trim()}`;
+    }
+
+    if (!path) return null;
+    if (/^https?:\/\//i.test(path)) return path;
+    return absUrl(path.replace(/^\//, ""));
+  }
+
+  /**
+   * Expand [[FIGURE:url|caption]] markers into HTML figures (before rehost).
+   */
+  private expandFigureMarkers(html: string): string {
+    return html.replace(
+      /\[\[\s*figure\s*:\s*(data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+|https?:\/\/[^\]|]+)\s*(?:\|\s*([^\]]*))?\s*\]\]/gi,
+      (_m, url: string, caption?: string) => {
+        const src = String(url || "").replace(/\s+/g, "").trim();
+        const cap = String(caption || "").trim();
+        if (!src) return "";
+        if (cap) {
+          return `<figure class="wp-article-figure"><img src="${src}" alt="${escapeHtml(cap)}" style="max-width:100%;height:auto;"><figcaption>${escapeHtml(cap)}</figcaption></figure>`;
+        }
+        return `<p><img src="${src}" alt="" style="max-width:100%;height:auto;"></p>`;
+      }
+    );
+  }
+
+  /**
+   * Download external/data images in article HTML and re-upload to Webypost
+   * (same path as CKEditor image upload). Replaces src with hosted URLs.
+   * Skips URLs already on the Webypost origin.
+   */
+  private async rehostHtmlBodyImages(html: string): Promise<{
+    html: string;
+    rehosted: number;
+    failed: string[];
+    map: Record<string, string>;
+  }> {
+    const failed: string[] = [];
+    const map: Record<string, string> = {};
+    let out = html;
+    const baseHost = (() => {
+      try {
+        return new URL(config.webypostBaseUrl).host.toLowerCase();
+      } catch {
+        return "webypost.com";
+      }
+    })();
+
+    // Collect unique src values from <img ... src="...">
+    const srcs = new Set<string>();
+    const srcRe =
+      /<img\b[^>]*?\bsrc\s*=\s*(["'])(.*?)\1/gi;
+    let m: RegExpExecArray | null;
+    while ((m = srcRe.exec(html)) !== null) {
+      const src = (m[2] || "").trim();
+      if (src) srcs.add(src);
+    }
+
+    let rehosted = 0;
+    const max = 15;
+    for (const src of srcs) {
+      if (rehosted >= max) break;
+      if (map[src]) continue;
+
+      // Already on our site / relative local path
+      if (
+        src.startsWith("upload/") ||
+        src.startsWith("/upload/") ||
+        src.startsWith("posts/") ||
+        src.startsWith("/posts/")
+      ) {
+        continue;
+      }
+      if (/^https?:\/\//i.test(src)) {
+        try {
+          const u = new URL(src);
+          if (u.host.toLowerCase() === baseHost || u.host.endsWith(".webypost.com")) {
+            continue;
+          }
+        } catch {
+          /* fall through and try download */
+        }
+      } else if (!src.startsWith("data:image/")) {
+        continue;
+      }
+
+      const resolved = await resolveImageSource(src, `body${rehosted + 1}`);
+      if (!resolved) {
+        failed.push(src.slice(0, 120));
+        continue;
+      }
+
+      const hosted = await this.uploadImageToWebypost(
+        resolved.blob,
+        resolved.filename
+      );
+      if (!hosted) {
+        failed.push(src.slice(0, 120));
+        continue;
+      }
+
+      map[src] = hosted;
+      // Replace all attribute occurrences of this src
+      const escaped = src.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      out = out.replace(
+        new RegExp(`(src\\s*=\\s*["'])${escaped}(["'])`, "gi"),
+        `$1${hosted}$2`
+      );
+      rehosted += 1;
+    }
+
+    return { html: out, rehosted, failed, map };
+  }
+
+  /**
    * Publish a long-form article via editor.php (AJAX JSON, same as web editor).
    * Maps: title→title, content→teaser, category→department, subcategory→subc.
+   * External body images are re-hosted to Webypost upload/ before save.
    */
   async publishArticle(input: PublishArticleInput): Promise<PublishResult> {
     const title = (input.title || "").trim();
@@ -466,6 +630,9 @@ export class WebypostClient {
       };
     }
 
+    // Expand [[FIGURE:url|caption]] before HTML wrap / rehost
+    body = this.expandFigureMarkers(body);
+
     // Editor stores HTML; wrap plain text paragraphs lightly
     if (!/<[a-z][\s\S]*>/i.test(body)) {
       body = body
@@ -483,6 +650,22 @@ export class WebypostClient {
         message: `Login required before publishing article: ${authFail.message}`,
         account: this.account.id,
         details: authFail.details,
+      };
+    }
+
+    // Re-host external / data: images onto Webypost (CKEditor upload.php)
+    let bodyRehost: {
+      rehosted: number;
+      failed: string[];
+    } = { rehosted: 0, failed: [] };
+    try {
+      const rh = await this.rehostHtmlBodyImages(body);
+      body = rh.html;
+      bodyRehost = { rehosted: rh.rehosted, failed: rh.failed };
+    } catch (e) {
+      bodyRehost = {
+        rehosted: 0,
+        failed: [e instanceof Error ? e.message : String(e)],
       };
     }
 
@@ -605,6 +788,10 @@ export class WebypostClient {
           subcategory,
           httpStatus: res.status,
           email: this.lastUserHint || this.account.email || null,
+          body_images_rehosted: bodyRehost.rehosted,
+          body_images_failed: bodyRehost.failed.length
+            ? bodyRehost.failed
+            : undefined,
         },
       };
     }
@@ -622,6 +809,10 @@ export class WebypostClient {
         type: "article",
         httpStatus: res.status,
         response: data,
+        body_images_rehosted: bodyRehost.rehosted,
+        body_images_failed: bodyRehost.failed.length
+          ? bodyRehost.failed
+          : undefined,
       },
     };
   }
